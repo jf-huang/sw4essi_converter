@@ -23,6 +23,14 @@ import functools
 print = functools.partial(print, flush=True) # Don't buffer print
 import hdf5plugin # Use this when SW4 output uses ZFP compression, can be installed with "pip install hdf5plugin"
 
+# from scipy.signal import butter,filtfilt
+# def butter_lowpass_filter(data, cutoff, nyq, order):
+#     normal_cutoff = cutoff / nyq
+#     # Get the filter coefficients
+#     b, a = butter(order, normal_cutoff, btype='low', analog=False)
+#     y = filtfilt(b, a, data, axis=0, method="gust")
+#     return y
+
 # plot a 3D cube and grid points specified by x, y, z arrays
 def plot_cube(save_path, cube_definition, x, y, z, view):
     cube_definition_array = [
@@ -112,8 +120,9 @@ def plot_cube(save_path, cube_definition, x, y, z, view):
     ax.yaxis.set_tick_params(labelsize=lblsize)
     ax.xaxis.set_tick_params(labelsize=lblsize)
     
-    ax.dist = 12
+    # ax.dist = 12
     #ax.set_aspect('equal')
+    ax.set_box_aspect(None, zoom=0.5)
     
     ax.text(cube_definition[2][0], cube_definition[2][1], cube_definition[2][2]-z_len*.05, 'SW4-ESSI domain', fontsize=7)
 
@@ -177,13 +186,14 @@ def read_coord_drm(drm_filename, verbose):
     drm_file = h5py.File(drm_filename, 'r')
     coordinates = drm_file['Coordinates']
     
-    drm_x = np.zeros(n_coord)
-    drm_y = np.zeros(n_coord)
-    drm_z = np.zeros(n_coord)
     isboundary = drm_file['Is Boundary Node'][:]
     
     if coordinates.shape[1] == 1:
         n_coord = int(coordinates.shape[0] / 3)
+        drm_x = np.zeros(n_coord)
+        drm_y = np.zeros(n_coord)
+        drm_z = np.zeros(n_coord)
+        
         for i in range(0, n_coord):
             drm_x[i] = coordinates[i*3]
             drm_y[i] = coordinates[i*3+1]
@@ -247,7 +257,8 @@ def convert_to_essi_coord(coord_sys, from_x, from_y, from_z, ref_essi_xyz):
             # user_essi_z = essi_nz - from_xyz[i] + ref_essi_xyz[2]
             user_essi_z = - from_xyz[i] + ref_essi_xyz[2]
     
-    return user_essi_x, user_essi_y, user_essi_z
+    # return user_essi_x, user_essi_y, user_essi_z
+    return np.round(user_essi_x, decimals=8), np.round(user_essi_y, decimals=8), np.round(user_essi_z, decimals=8)
 
     
 def get_coords_range(x, x_min_val, x_max_val, add_ghost):
@@ -484,10 +495,13 @@ def write_to_hdf5_range_2d(h5_fname, gname, dname, data, mystart, myend):
     dset[mystart:myend,:] = data[:,:]
     h5file.close()
     
-def create_hdf5_opensees(h5_fname, ncoord, nstep, dt, gen_vel, gen_acc, gen_dis, extra_dname):
+def create_hdf5_opensees(h5_fname, ncoord, tsteprange, essi_dt, gen_vel, gen_acc, gen_dis, extra_dname):
+    tstart, tend, tstep = (tsteprange[0]+1)*essi_dt, (tsteprange[-1]+1)*essi_dt, tsteprange.step
+    nstep = len(tsteprange)
+    dt = tstep*essi_dt
+    
     h5file = h5py.File(h5_fname, 'w')
     data_grp = h5file.create_group('DRM_Data')
-    
     data_location = np.zeros(ncoord, dtype='i4')
     for i in range(0, ncoord):
         data_location[i] = 3*i
@@ -504,17 +518,19 @@ def create_hdf5_opensees(h5_fname, ncoord, nstep, dt, gen_vel, gen_acc, gen_dis,
     
     data_grp = h5file.create_group('DRM_Metadata')
     dset = data_grp.create_dataset('dt', data=dt, dtype='f8')
-    tstart = 0.0
-    tend = nstep*dt
-    dset = data_grp.create_dataset('tend', data=tend, dtype='f8')
-    dset = data_grp.create_dataset('tstart', data=tstart, dtype='f8')
+    dset = data_grp.create_dataset('tstart', data=dt, dtype='f8')
+    dset = data_grp.create_dataset('tend', data=tend - tstart + dt, dtype='f8')
     
     h5file.close()
 
-def create_hdf5_csv(h5_fname, ncoord, nstep, dt, gen_vel, gen_acc, gen_dis, extra_dname):
-    print('Create HDF5 file with ', ncoord, ' coordinates, ', nstep, ' steps')
-    h5file = h5py.File(h5_fname, 'w')
+def create_hdf5_csv(h5_fname, ncoord, tsteprange, essi_dt, gen_vel, gen_acc, gen_dis, extra_dname):
 
+    h5file = h5py.File(h5_fname, 'w')
+    tstart, tend, tstep = (tsteprange[0]+1)*essi_dt, (tsteprange[-1]+1)*essi_dt, tsteprange.step
+    nstep = len(tsteprange)
+    dt = tstep*essi_dt
+    
+    print('Create HDF5 file with ', ncoord, ' coordinates, ', nstep, ' steps')
     if gen_vel:
         dset = h5file.create_dataset('velocity', (ncoord*3, nstep), dtype='f4')
     if gen_acc:        
@@ -525,11 +541,12 @@ def create_hdf5_csv(h5_fname, ncoord, nstep, dt, gen_vel, gen_acc, gen_dis, extr
     dset = h5file.create_dataset(extra_dname, (ncoord,), dtype='i4')
     dset = h5file.create_dataset('xyz', (ncoord, 3), dtype='f4')
     
-    dset = h5file.create_dataset('dt', data=dt, dtype='f8')
-    tstart = 0.0
-    tend = nstep*dt
-    dset = h5file.create_dataset('tend', data=tend, dtype='f8')
-    dset = h5file.create_dataset('tstart', data=tstart, dtype='f8')
+    # use array form [dt] instead of scalar dt, so that it has a shape and facilitate postprocessing
+    dset = h5file.create_dataset('dt', data=[dt], dtype='f8')
+    # tstart = 0.0
+    # tend = nstep*dt
+    dset = h5file.create_dataset('tstart', data=[dt], dtype='f8')
+    dset = h5file.create_dataset('tend', data=[tend - tstart + dt], dtype='f8')
     
     h5file.close()
 
@@ -715,7 +732,8 @@ def generate_acc_dis_time(ssi_fname, coord_sys, ref_coord, user_x0, user_y0, use
     # Note: this should be done before rotation, motion zero-out in the out-of-plane direction will be done later
     # TODO: here we use the middle crd in that direction by default
     user_x, user_y, user_z = user_x0, user_y0, user_z0
-    if zeroMotionDir != 'None':
+    # print(f'zeroMotionDir={zeroMotionDir}')
+    if zeroMotionDir not in ['None', 'No']:
       middleCrd = None
       if zeroMotionDir.upper() == 'X':
         middleCrd = (np.amin(user_x0) + np.amax(user_x0)) / 2.
@@ -728,8 +746,7 @@ def generate_acc_dis_time(ssi_fname, coord_sys, ref_coord, user_x0, user_y0, use
         user_z = np.full(user_z0.shape, middleCrd)
 
       if mpi_rank == 0:
-        print('Zero out motion in {} direction, and for all nodes across that direction, use motion on plane {}={:.4f}'.\
-          format(zeroMotionDir, zeroMotionDir, middleCrd))
+        print(f'Zero out motion in {zeroMotionDir} direction, and for all nodes across that direction, use motion on plane {zeroMotionDir}={middleCrd}')
 
     # Rotate the coordinates in the OpenSees xy plane around the vertical (z) axis
     # rotate/transform only when rotate_angle is other than 0 (default min difference is 1e-2)
@@ -858,8 +875,8 @@ def generate_acc_dis_time(ssi_fname, coord_sys, ref_coord, user_x0, user_y0, use
     # coords_str_dict = {}
     is_boundary = np.zeros(n_coord, dtype='i4')
     my_ncoord = np.zeros(1, dtype='int')
-    my_user_coordinates = np.zeros((n_coord,3), dtype='f4')
-    my_converted_coordinates = np.zeros((n_coord,3), dtype='f4')
+    my_user_coordinates = np.zeros((n_coord,3), dtype='f8')
+    my_converted_coordinates = np.zeros((n_coord,3), dtype='f8')
     my_cids_dict = {} # format: {cid1:{coord_str1,},}, includes all the chunks for interpolation in this rank
 
     for i in range(0, n_coord):
@@ -963,6 +980,17 @@ def generate_acc_dis_time(ssi_fname, coord_sys, ref_coord, user_x0, user_y0, use
           for vel_iter in read_coords_vel_2:
             read_coords_vel_2[vel_iter][:] *= -1
 
+      # if True:
+      #   starttime = time.time()
+      #   for vel_iter in read_coords_vel_0:
+      #     read_coords_vel_0[vel_iter] = butter_lowpass_filter(read_coords_vel_0[vel_iter], 5, 0.5/essi_dt, 4)
+      #     read_coords_vel_1[vel_iter] = butter_lowpass_filter(read_coords_vel_1[vel_iter], 5, 0.5/essi_dt, 4)
+      #     read_coords_vel_2[vel_iter] = butter_lowpass_filter(read_coords_vel_2[vel_iter], 5, 0.5/essi_dt, 4)
+      #   endtime = time.time()
+      #   # if verbose: 
+      #   print('Rank {}: lowpass filter took {:.3f}s'.format(mpi_rank, endtime-starttime))
+      #     #sys.stdout.flush()
+        
       # # debug output
       # if mpi_rank == 0:
       #   import pickle
@@ -1127,7 +1155,7 @@ def generate_acc_dis_time(ssi_fname, coord_sys, ref_coord, user_x0, user_y0, use
     
     if output_format == "OpenSees":
         if mpi_rank == 0:
-            create_hdf5_opensees(output_fname, n_coord, nsteps, dt, gen_vel, gen_acc, gen_dis, extra_dname)    
+            create_hdf5_opensees(output_fname, n_coord, tsteprange, essi_dt, gen_vel, gen_acc, gen_dis, extra_dname)    
 
             if my_ncoord[0] > 0:
                 write_to_hdf5_range_2d(output_fname, 'DRM_Data', 'xyz', my_user_coordinates, my_offset, (my_offset+my_ncoord[0]))
@@ -1159,7 +1187,7 @@ def generate_acc_dis_time(ssi_fname, coord_sys, ref_coord, user_x0, user_y0, use
 
     elif output_format == "csv" or output_format == "h5":
         if mpi_rank == 0:
-            create_hdf5_csv(output_fname, n_coord, nsteps, dt, gen_vel, gen_acc, gen_dis, extra_dname)    
+            create_hdf5_csv(output_fname, n_coord, tsteprange, essi_dt, gen_vel, gen_acc, gen_dis, extra_dname)    
 
             if my_ncoord[0] > 0:
                 write_to_hdf5_range_2d(output_fname, '/', 'xyz', my_user_coordinates, my_offset, (my_offset+my_ncoord[0]))
@@ -1230,7 +1258,6 @@ def generate_acc_dis_time(ssi_fname, coord_sys, ref_coord, user_x0, user_y0, use
     
 def convert_drm(drm_fname, ssi_fname, save_path, ref_coord, start_t, end_t, tstep, rotate_angle, zeroMotionDir, plot_only, mpi_rank, mpi_size, verbose):
     if mpi_rank == 0:
-        print('Start time:', datetime.datetime.now().time())
         print('Input  DRM [%s]' %drm_fname)
         print('Input ESSI [%s]' %ssi_fname)
 
@@ -1256,13 +1283,12 @@ def convert_drm(drm_fname, ssi_fname, save_path, ref_coord, start_t, end_t, tste
 
 def convert_h5(h5_fname, ssi_fname, save_path, ref_coord, start_t, end_t, tstep, rotate_angle, zeroMotionDir, plot_only, mpi_rank, mpi_size, verbose):
     if mpi_rank == 0:
-        print('Start time:', datetime.datetime.now().time())
         print('Input h5   [%s]' %h5_fname)
         print('Input ESSI [%s]' %ssi_fname)
         
     coord_sys = ['y', 'x', '-z']
-    gen_vel = False
-    gen_dis = False
+    gen_vel = True
+    gen_dis = True
     gen_acc = True  
     extra_dname = 'nodeTag'
 
@@ -1282,7 +1308,6 @@ def convert_h5(h5_fname, ssi_fname, save_path, ref_coord, start_t, end_t, tstep,
         
 def convert_csv(csv_fname, ssi_fname, save_path, ref_coord, start_t, end_t, tstep, rotate_angle, zeroMotionDir, plot_only, mpi_rank, mpi_size, verbose):
     if mpi_rank == 0:
-        print('Start time:', datetime.datetime.now().time())
         print('Input  CSV [%s]' %csv_fname)
         print('Input ESSI [%s]' %ssi_fname)
         
@@ -1320,7 +1345,6 @@ def dframeToDict(dFrame):
 
 def convert_template(csv_fname, template_fname, ssi_fname, start_ts, end_ts, plot_only, mpi_rank, mpi_size, verbose):
     if mpi_rank == 0:
-        print('Start time:', datetime.datetime.now().time())
         print('Input  CSV [%s]' %csv_fname)
         print('Input ESSI [%s]' %ssi_fname)
         
@@ -1377,7 +1401,7 @@ def convert_template(csv_fname, template_fname, ssi_fname, start_ts, end_ts, plo
     return    
 
 if __name__ == "__main__":
-    
+  
     os.environ['HDF5_USE_FILE_LOCKING'] = 'FALSE'
     os.environ['PYTHONUNBUFFERED'] = 'TRUE'
     verbose=False
@@ -1461,6 +1485,10 @@ if __name__ == "__main__":
         print('Running with ', mpi_size, 'MPI processes')
         os.makedirs(save_path, exist_ok=True)
         
+        startTime = time.time()
+        startTimeStr = time.strftime("%Y/%m/%d %H:%M:%S", time.localtime(startTime))
+        print('Start time:', startTimeStr)
+    
     if drm_fname == '' and csv_fname == '' and template_fname == '':
         print('Error, no node coordinate input file is provided, exit...')
         exit(0)
@@ -1481,4 +1509,6 @@ if __name__ == "__main__":
         convert_template(csv_fname, template_fname, ssi_fname, start_t, end_t, plotonly, mpi_rank, mpi_size, verbose)
         
     if mpi_rank == 0:
-        print('End time:', datetime.datetime.now().time())
+        endTime = time.time()
+        endTimeStr = time.strftime("%Y/%m/%d %H:%M:%S", time.localtime(endTime))
+        print(f'End time: {endTimeStr} (time spent: {endTime-startTime:.2f} s)')
