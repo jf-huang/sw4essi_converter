@@ -6,8 +6,14 @@ import os
 import argparse
 import h5py
 import math
+
 import scipy
 from scipy import integrate
+if int(scipy.__version__.split('.')[1]) >= 6: # the function was renamed in SciPy 1.6.0
+  cumtrapz = scipy.integrate.cumulative_trapezoid
+else:
+  cumtrapz = scipy.integrate.cumtrapz
+
 import numpy as np
 import pandas as pd
 import datetime
@@ -188,20 +194,21 @@ def read_coord_drm(drm_filename, verbose):
     
     isboundary = drm_file['Is Boundary Node'][:]
     
+    drm_x = np.zeros(n_coord, dtype='f8') # use float64 to avoid rounding-off error during crd manipulation (rotation, etc) later on
+    drm_y = np.zeros(n_coord, dtype='f8')
+    drm_z = np.zeros(n_coord, dtype='f8')
+    
     if coordinates.shape[1] == 1:
         n_coord = int(coordinates.shape[0] / 3)
-        drm_x = np.zeros(n_coord)
-        drm_y = np.zeros(n_coord)
-        drm_z = np.zeros(n_coord)
         
         for i in range(0, n_coord):
             drm_x[i] = coordinates[i*3]
             drm_y[i] = coordinates[i*3+1]
             drm_z[i] = coordinates[i*3+2]
     else: # coordinates.shape[1] == 3
-        drm_x = coordinates[:,0]
-        drm_y = coordinates[:,1]
-        drm_z = coordinates[:,2]
+        drm_x[:] = coordinates[:,0]
+        drm_y[:] = coordinates[:,1]
+        drm_z[:] = coordinates[:,2]
 
     drm_file.close()
     return drm_x, drm_y, drm_z, n_coord, isboundary
@@ -215,10 +222,11 @@ def read_coord_h5(h5_filename, verbose):
     coordinates = h5_file['coordinate']
     n_coord = coordinates.shape[0]
     
-    h5_x = np.zeros(n_coord)
-    h5_y = np.zeros(n_coord)
-    h5_z = np.zeros(n_coord)
+    h5_x = np.zeros(n_coord, dtype='f8') # use float64 to avoid rounding-off error during crd manipulation (rotation, etc) later on
+    h5_y = np.zeros(n_coord, dtype='f8')
+    h5_z = np.zeros(n_coord, dtype='f8')
     nodeTags = h5_file['nodeTag'][:]
+    # print('h5_x.dtype: ', h5_x.dtype)
     
     if coordinates.shape[1] == 1:
         n_coord = int(coordinates.shape[0] / 3)
@@ -227,11 +235,16 @@ def read_coord_h5(h5_filename, verbose):
             h5_y[i] = coordinates[i*3+1]
             h5_z[i] = coordinates[i*3+2]
     else: # coordinates.shape[1] == 3
-        h5_x = coordinates[:,0]
-        h5_y = coordinates[:,1]
-        h5_z = coordinates[:,2]
+        # h5_x = coordinates[:,0] # use float32
+        # h5_y = coordinates[:,1]
+        # h5_z = coordinates[:,2]
+        h5_x[:] = coordinates[:,0] # use float64
+        h5_y[:] = coordinates[:,1]
+        h5_z[:] = coordinates[:,2]
 
     h5_file.close()
+    
+    # print('h5_x.dtype: ', h5_x.dtype)
     return h5_x, h5_y, h5_z, n_coord, nodeTags
 
 # changed ref coord as just offsets
@@ -566,9 +579,22 @@ def create_hdf5_essi(h5_fname, ncoord, nstep, dt, gen_vel, gen_acc, gen_dis, ext
     
     h5file.close()
     
-def coord_to_chunkid(x, y, z, chk_x, chk_y, chk_z, nchk_x, nchk_y, nchk_z):
+# def coord_to_chunkid(x, y, z, chk_x, chk_y, chk_z, nchk_x, nchk_y, nchk_z):
+#     val = int(np.floor(x/chk_x)*nchk_y*nchk_z + np.floor(y/chk_y)*nchk_z + np.floor(z/chk_z))
+#     #print('coord_to_chunkid:', x, y, z, chk_x, chk_y, chk_z, nchk_x, nchk_y, nchk_z, val)
+#     return val
+def coord_to_chunkid(x0, y0, z0, chk_x, chk_y, chk_z, nchk_x, nchk_y, nchk_z, nx, ny, nz):
+    # Due to allocation of neighbor nodes, the indices may exceed the original dataset 
+    # boundary and thus need to be corrected so that the correct nearest chunk can be fetched later
+    x, y, z = min(x0, nx-1), min(y0, ny-1), min(z0, nz-1)
+    
     val = int(np.floor(x/chk_x)*nchk_y*nchk_z + np.floor(y/chk_y)*nchk_z + np.floor(z/chk_z))
     #print('coord_to_chunkid:', x, y, z, chk_x, chk_y, chk_z, nchk_x, nchk_y, nchk_z, val)
+    
+    str_crd = coord_to_str_3d(x0, y0, z0)
+    if str_crd == '2900, 7100, 1':
+        print(f'{str_crd}: cid: {val}')
+      
     return val
 
 def chunkid_to_start(cid, chk_x, chk_y, chk_z, nchk_x, nchk_y, nchk_z):
@@ -587,13 +613,13 @@ def get_chunk_size(ssi_fname):
     #print('Chunk size:', dims)
     return int(dims[0]), int(dims[1]), int(dims[2]), int(dims[3])
     
-def get_nchunk_from_coords(x, y, z, chk_x, chk_y, chk_z, nchk_x, nchk_y, nchk_z):
+def get_nchunk_from_coords(x, y, z, chk_x, chk_y, chk_z, nchk_x, nchk_y, nchk_z, nx, ny, nz):
     if len(x) != len(y) or len(y) != len(z):
         print('Not equal sizes of the x,y,z coordinates array')
     chk_ids = {}
     cnt = 0
     for i in range(0, len(x)):
-        cid = coord_to_chunkid(x[i], y[i], z[i], chk_x, chk_y, chk_z, nchk_x, nchk_y, nchk_z)
+        cid = coord_to_chunkid(x[i], y[i], z[i], chk_x, chk_y, chk_z, nchk_x, nchk_y, nchk_z, nx, ny, nz)
         if cid not in chk_ids:
             chk_ids[cid] = cnt
             cnt += 1
@@ -606,7 +632,7 @@ def str_to_coord_3d(s):
     val = s.split(',')
     return int(val[0]), int(val[1]), int(val[2])
     
-def allocate_neighbor_coords_8(data_dict, x, y, z, n, chk_x, chk_y, chk_z, nchk_x, nchk_y, nchk_z):
+def allocate_neighbor_coords_8(data_dict, x, y, z, n, chk_x, chk_y, chk_z, nchk_x, nchk_y, nchk_z, nx, ny, nz):
     nadd = 0
     add_cids_dict = {}
     neighbour = 2
@@ -619,7 +645,7 @@ def allocate_neighbor_coords_8(data_dict, x, y, z, n, chk_x, chk_y, chk_z, nchk_
                     data_dict[coord_str] = np.zeros(n)
                     nadd += 1
 
-                    cid = coord_to_chunkid(intx, inty, intz, chk_x, chk_y, chk_z, nchk_x, nchk_y, nchk_z)
+                    cid = coord_to_chunkid(intx, inty, intz, chk_x, chk_y, chk_z, nchk_x, nchk_y, nchk_z, nx, ny, nz)
                     if cid in add_cids_dict:
                         add_cids_dict[cid].add(coord_str)
                     else:
@@ -631,7 +657,7 @@ def allocate_neighbor_coords_8(data_dict, x, y, z, n, chk_x, chk_y, chk_z, nchk_
                 
     return nadd, add_cids_dict
 
-def read_hdf5_by_chunk(ssi_fname, data_dict, comp, cids_dict, chk_x, chk_y, chk_z, nchk_x, nchk_y, nchk_z, chk_t, mpi_rank, verbose):
+def read_hdf5_by_chunk(ssi_fname, data_dict, comp, cids_dict, chk_x, chk_y, chk_z, nchk_x, nchk_y, nchk_z, chk_t, nx, ny, nz, mpi_rank, verbose):
     fid = h5py.File(ssi_fname, 'r')
     dset_name = 'vel_' + str(int(comp)) + ' ijk layout'
     for cids_iter in cids_dict:
@@ -643,10 +669,10 @@ def read_hdf5_by_chunk(ssi_fname, data_dict, comp, cids_dict, chk_x, chk_y, chk_
             starttime = time.time()
             chk_data = fid[dset_name][int(chk_t*start_t):int(chk_t*(start_t+1)), int(start_x):int(start_x+chk_x), int(start_y):int(start_y+chk_y), int(start_z):int(start_z+chk_z)]
             endtime = time.time()
-            if verbose: 
-                # print('Rank', mpi_rank, 'read: cid', cids_iter, dset_name, ',time sub chunk', start_t+1, '/', nread, 'time:', endtime-starttime)
-                print('Rank {:3d} read: chunk cid {:4d} {}, time slice {:3d}/{} took {:.3f}s'.format(mpi_rank, cids_iter, dset_name, start_t+1, nread, endtime-starttime))
-                #sys.stdout.flush()
+            # if verbose: 
+            #     # print('Rank', mpi_rank, 'read: cid', cids_iter, dset_name, ',time sub chunk', start_t+1, '/', nread, 'time:', endtime-starttime)
+            #     print('Rank {:3d} read: chunk cid {:4d} {}, time slice {:3d}/{} took {:.3f}s'.format(mpi_rank, cids_iter, dset_name, start_t+1, nread, endtime-starttime))
+            #     #sys.stdout.flush()
 
             starttime = time.time()
             for coord_str in cids_dict[cids_iter]:
@@ -654,7 +680,24 @@ def read_hdf5_by_chunk(ssi_fname, data_dict, comp, cids_dict, chk_x, chk_y, chk_
                 # assign values from chunk to data_dict[coord_str][0:3]
                 # print('==assign values for', x, y, z, '->', x%chk_x, y%chk_y, z%chk_z, 'cid', cids_iter, 'is in ', cids_iter, 'timestep', chk_t*start_t)
                 # print('shape is:', data_dict[coord_str].shape, chk_data.shape)
-                data_dict[coord_str][chk_t*start_t:chk_t*(start_t+1)] = chk_data[:,x%chk_x,y%chk_y,z%chk_z]
+                # data_dict[coord_str][chk_t*start_t:chk_t*(start_t+1)] = chk_data[:,x%chk_x,y%chk_y,z%chk_z]
+                
+                # in the axis that exceeds the original boundary, use the data at the boundary for later interpolation purpose
+                ix = x % chk_x if x <= nx - 1 else -1
+                iy = y % chk_y if y <= ny - 1 else -1
+                iz = z % chk_z if z <= nz - 1 else -1
+                data_dict[coord_str][chk_t*start_t:chk_t*(start_t+1)] = chk_data[:,ix,iy,iz]
+                
+                # try:
+                #   data_dict[coord_str][chk_t*start_t:chk_t*(start_t+1)] = chk_data[:,ix,iy,iz]
+                # except IndexError:
+                #   if mpi_rank == 0:
+                #     print('==assign values for', x, y, z, '->', x%chk_x, y%chk_y, z%chk_z, 'cid', cids_iter, 'is in ', cids_iter, 'timestep', chk_t*start_t)
+                #     print(f'coord_str: {coord_str}')
+                #     print(f'chk_data.shape = {chk_data.shape}, chk_x, chk_y, chk_z={chk_x}, {chk_y}, {chk_z}')
+                #     print(f'int(start_y):int(start_y+chk_y)={int(start_y)}:{int(start_y+chk_y)}')
+                #     raise Exception('Error reading chunk data')
+                
             endtime = time.time()
             #print('assign value time', endtime-starttime)
     fid.close()
@@ -763,6 +806,12 @@ def generate_acc_dis_time(ssi_fname, coord_sys, ref_coord, user_x0, user_y0, use
         if i == 0:
             print('converted essi coordinate:')
         print('(%d, %d, %d)' % (user_essi_x[i], user_essi_y[i], user_essi_z[i]))
+        
+    # with open('tmp.txt', 'w') as tmpfile:
+    #     tmpfile.write('(%d, %d, %d)' % (user_essi_x[i], user_essi_y[i], user_essi_z[i]))
+    # print('user_essi_x.dtype: ', user_essi_x.dtype)
+    # print('user_x0.dtype: ', user_x0.dtype)
+    # np.savetxt('tmp.txt', np.c_[user_essi_x, user_essi_y, user_essi_z], fmt='%.6f')
 
     # Plot
     if mpi_rank == 0:
@@ -789,6 +838,11 @@ def generate_acc_dis_time(ssi_fname, coord_sys, ref_coord, user_x0, user_y0, use
             np.save(debugfile, np.c_[user_essi_x, user_essi_y, user_essi_z])
         exit(0)
     
+    if verbose and mpi_rank == 0:
+        print('\t','Min/Max SW4 x:',essi_x0,essi_x0+essi_x_len_max,'Min/Max user x:',np.min(user_essi_x),np.max(user_essi_x))
+        print('\t','Min/Max SW4 y:',essi_y0,essi_y0+essi_y_len_max,'Min/Max user y:',np.min(user_essi_y),np.max(user_essi_y))
+        print('\t','Min/Max SW4 z:',essi_z0,essi_z0+essi_z_len_max,'Min/Max user z:',np.min(user_essi_z),np.max(user_essi_z))
+            
     # if mpi_rank == 0:
     #   print('while user_essi_xyz (after rotation) is:\n', np.c_[user_essi_x, user_essi_y, user_essi_z])
     #   exit(0)
@@ -806,6 +860,7 @@ def generate_acc_dis_time(ssi_fname, coord_sys, ref_coord, user_x0, user_y0, use
         if user_essi_x[nid] % essi_h != 0 or user_essi_y[nid] % essi_h != 0 or user_essi_z[nid] % essi_h != 0:
             do_interp = True
             # ghost_cell = 1
+            print(f'user_essi_x[{nid}], user_essi_y[{nid}], user_essi_z[{nid}]: {user_essi_x[nid]:.4f}, f{user_essi_y[nid]:.4f}, f{user_essi_z[nid]:.4f}')
             break    
     if mpi_rank == 0:
       if do_interp:
@@ -852,7 +907,7 @@ def generate_acc_dis_time(ssi_fname, coord_sys, ref_coord, user_x0, user_y0, use
                 
         # Find chunks where all the user input coordinates are (not including adjacent chunks for interpolation yet)
         # cids_dict format: {cid1:index1_in_all_cids,}
-        nchk, cids_dict = get_nchunk_from_coords(coord_x, coord_y, coord_z, chk_x, chk_y, chk_z, nchk_x, nchk_y, nchk_z)
+        nchk, cids_dict = get_nchunk_from_coords(coord_x, coord_y, coord_z, chk_x, chk_y, chk_z, nchk_x, nchk_y, nchk_z, essi_nx, essi_ny, essi_nz)
         # if mpi_rank == 0:
         #   print('ntry, nchk, mpi_size, cids_dict, chk_x, chk_y, chk_z = ', ntry, nchk, mpi_size, cids_dict, chk_x, chk_y, chk_z)
 
@@ -880,7 +935,7 @@ def generate_acc_dis_time(ssi_fname, coord_sys, ref_coord, user_x0, user_y0, use
     my_cids_dict = {} # format: {cid1:{coord_str1,},}, includes all the chunks for interpolation in this rank
 
     for i in range(0, n_coord):
-        cid = coord_to_chunkid(coord_x[i], coord_y[i], coord_z[i], chk_x, chk_y, chk_z, nchk_x, nchk_y, nchk_z)
+        cid = coord_to_chunkid(coord_x[i], coord_y[i], coord_z[i], chk_x, chk_y, chk_z, nchk_x, nchk_y, nchk_z, essi_nx, essi_ny, essi_nz)
         if cid < 0:
             print('Error with coord_to_chunkid', coord_x[i], coord_y[i], coord_z[i], cid)
             exit(0)
@@ -907,9 +962,9 @@ def generate_acc_dis_time(ssi_fname, coord_sys, ref_coord, user_x0, user_y0, use
             # if coord_x[i] % 1 != 0 or coord_y[i] % 1 != 0 or coord_z[i] % 1 != 0:
             if do_interp:
                 # Linear interpolation requires 8 neighbours' data
-                nadded, add_cids_dict = allocate_neighbor_coords_8(read_coords_vel_0, coord_x[i], coord_y[i], coord_z[i], essi_nt, chk_x, chk_y, chk_z, nchk_x, nchk_y, nchk_z)
-                nadded, add_cids_dict = allocate_neighbor_coords_8(read_coords_vel_1, coord_x[i], coord_y[i], coord_z[i], essi_nt, chk_x, chk_y, chk_z, nchk_x, nchk_y, nchk_z)
-                nadded, add_cids_dict = allocate_neighbor_coords_8(read_coords_vel_2, coord_x[i], coord_y[i], coord_z[i], essi_nt, chk_x, chk_y, chk_z, nchk_x, nchk_y, nchk_z)
+                nadded, add_cids_dict = allocate_neighbor_coords_8(read_coords_vel_0, coord_x[i], coord_y[i], coord_z[i], essi_nt, chk_x, chk_y, chk_z, nchk_x, nchk_y, nchk_z, essi_nx, essi_ny, essi_nz)
+                nadded, add_cids_dict = allocate_neighbor_coords_8(read_coords_vel_1, coord_x[i], coord_y[i], coord_z[i], essi_nt, chk_x, chk_y, chk_z, nchk_x, nchk_y, nchk_z, essi_nx, essi_ny, essi_nz)
+                nadded, add_cids_dict = allocate_neighbor_coords_8(read_coords_vel_2, coord_x[i], coord_y[i], coord_z[i], essi_nt, chk_x, chk_y, chk_z, nchk_x, nchk_y, nchk_z, essi_nx, essi_ny, essi_nz)
 
                 # print('Rank', mpi_rank, ': add_cids_dict =', add_cids_dict)
 
@@ -939,7 +994,7 @@ def generate_acc_dis_time(ssi_fname, coord_sys, ref_coord, user_x0, user_y0, use
     if verbose:
         print('Rank', mpi_rank, 'has my_cids_dict.keys() =', my_cids_dict.keys())
 
-    # Allocated more than needed previously, adjust
+    # Allocated more than needed previously, resize here
     my_user_coordinates.resize(my_ncoord[0], 3)
     my_converted_coordinates.resize(my_ncoord[0], 3)
     is_boundary.resize(my_ncoord[0])
@@ -960,23 +1015,23 @@ def generate_acc_dis_time(ssi_fname, coord_sys, ref_coord, user_x0, user_y0, use
     # Read data by chunk and assign to read_coords_vel_012
       for dim_iter in range(0, 3):
         if coord_sys[dim_iter] == 'x':
-          read_hdf5_by_chunk(ssi_fname, read_coords_vel_0, dim_iter, my_cids_dict, chk_x, chk_y, chk_z, nchk_x, nchk_y, nchk_z, chk_t, mpi_rank, verbose)
+          read_hdf5_by_chunk(ssi_fname, read_coords_vel_0, dim_iter, my_cids_dict, chk_x, chk_y, chk_z, nchk_x, nchk_y, nchk_z, chk_t, essi_nx, essi_ny, essi_nz, mpi_rank, verbose)
         elif coord_sys[dim_iter] == '-x':
-          read_hdf5_by_chunk(ssi_fname, read_coords_vel_0, dim_iter, my_cids_dict, chk_x, chk_y, chk_z, nchk_x, nchk_y, nchk_z, chk_t, mpi_rank, verbose)
+          read_hdf5_by_chunk(ssi_fname, read_coords_vel_0, dim_iter, my_cids_dict, chk_x, chk_y, chk_z, nchk_x, nchk_y, nchk_z, chk_t, essi_nx, essi_ny, essi_nz, mpi_rank, verbose)
           for vel_iter in read_coords_vel_0:
             read_coords_vel_0[vel_iter][:] *= -1
 
         elif coord_sys[dim_iter] == 'y':
-          read_hdf5_by_chunk(ssi_fname, read_coords_vel_1, dim_iter, my_cids_dict, chk_x, chk_y, chk_z, nchk_x, nchk_y, nchk_z, chk_t, mpi_rank, verbose)
+          read_hdf5_by_chunk(ssi_fname, read_coords_vel_1, dim_iter, my_cids_dict, chk_x, chk_y, chk_z, nchk_x, nchk_y, nchk_z, chk_t, essi_nx, essi_ny, essi_nz, mpi_rank, verbose)
         elif coord_sys[dim_iter] == '-y':
-          read_hdf5_by_chunk(ssi_fname, read_coords_vel_1, dim_iter, my_cids_dict, chk_x, chk_y, chk_z, nchk_x, nchk_y, nchk_z, chk_t, mpi_rank, verbose)
+          read_hdf5_by_chunk(ssi_fname, read_coords_vel_1, dim_iter, my_cids_dict, chk_x, chk_y, chk_z, nchk_x, nchk_y, nchk_z, chk_t, essi_nx, essi_ny, essi_nz, mpi_rank, verbose)
           for vel_iter in read_coords_vel_1:
             read_coords_vel_1[vel_iter][:] *= -1
             
         elif coord_sys[dim_iter] == 'z':
-          read_hdf5_by_chunk(ssi_fname, read_coords_vel_2, dim_iter, my_cids_dict, chk_x, chk_y, chk_z, nchk_x, nchk_y, nchk_z, chk_t, mpi_rank, verbose)
+          read_hdf5_by_chunk(ssi_fname, read_coords_vel_2, dim_iter, my_cids_dict, chk_x, chk_y, chk_z, nchk_x, nchk_y, nchk_z, chk_t, essi_nx, essi_ny, essi_nz, mpi_rank, verbose)
         elif coord_sys[dim_iter] == '-z':
-          read_hdf5_by_chunk(ssi_fname, read_coords_vel_2, dim_iter, my_cids_dict, chk_x, chk_y, chk_z, nchk_x, nchk_y, nchk_z, chk_t, mpi_rank, verbose)
+          read_hdf5_by_chunk(ssi_fname, read_coords_vel_2, dim_iter, my_cids_dict, chk_x, chk_y, chk_z, nchk_x, nchk_y, nchk_z, chk_t, essi_nx, essi_ny, essi_nz, mpi_rank, verbose)
           for vel_iter in read_coords_vel_2:
             read_coords_vel_2[vel_iter][:] *= -1
 
@@ -1039,9 +1094,9 @@ def generate_acc_dis_time(ssi_fname, coord_sys, ref_coord, user_x0, user_y0, use
                 read_coords_acc_2[vel_iter] =  np.gradient(read_coords_vel_2[vel_iter][:], essi_dt, axis=0)
                 
             if gen_dis:
-                read_coords_dis_0[vel_iter] =  scipy.integrate.cumtrapz(y=read_coords_vel_0[vel_iter][:], dx=essi_dt, initial=0, axis=0)
-                read_coords_dis_1[vel_iter] =  scipy.integrate.cumtrapz(y=read_coords_vel_1[vel_iter][:], dx=essi_dt, initial=0, axis=0)
-                read_coords_dis_2[vel_iter] =  scipy.integrate.cumtrapz(y=read_coords_vel_2[vel_iter][:], dx=essi_dt, initial=0, axis=0)
+                read_coords_dis_0[vel_iter] =  cumtrapz(y=read_coords_vel_0[vel_iter][:], dx=essi_dt, initial=0, axis=0)
+                read_coords_dis_1[vel_iter] =  cumtrapz(y=read_coords_vel_1[vel_iter][:], dx=essi_dt, initial=0, axis=0)
+                read_coords_dis_2[vel_iter] =  cumtrapz(y=read_coords_vel_2[vel_iter][:], dx=essi_dt, initial=0, axis=0)
                 
         # Iterate over all actual coordinates (no neighbour)
         # iter_count = 0
@@ -1084,9 +1139,9 @@ def generate_acc_dis_time(ssi_fname, coord_sys, ref_coord, user_x0, user_y0, use
                 #if iter_count == 0:
                 #    print('acc_0 for', vel_iter, 'is:', output_acc_all[iter_count,:])                
             if gen_dis:
-                output_dis_all[iter_count*3+0, :] =  scipy.integrate.cumtrapz(y=read_coords_vel_0[coord_str][:], dx=essi_dt, initial=0, axis=0)
-                output_dis_all[iter_count*3+1, :] =  scipy.integrate.cumtrapz(y=read_coords_vel_1[coord_str][:], dx=essi_dt, initial=0, axis=0)
-                output_dis_all[iter_count*3+2, :] =  scipy.integrate.cumtrapz(y=read_coords_vel_2[coord_str][:], dx=essi_dt, initial=0, axis=0)   
+                output_dis_all[iter_count*3+0, :] =  cumtrapz(y=read_coords_vel_0[coord_str][:], dx=essi_dt, initial=0, axis=0)
+                output_dis_all[iter_count*3+1, :] =  cumtrapz(y=read_coords_vel_1[coord_str][:], dx=essi_dt, initial=0, axis=0)
+                output_dis_all[iter_count*3+2, :] =  cumtrapz(y=read_coords_vel_2[coord_str][:], dx=essi_dt, initial=0, axis=0)   
                 #if iter_count == 0:
                 #    print('dis_0 for', vel_iter, 'is:', output_dis_all[iter_count,:])                
             if gen_vel:
@@ -1300,7 +1355,8 @@ def convert_h5(h5_fname, ssi_fname, save_path, ref_coord, start_t, end_t, tstep,
         print('Generating motions for %i nodes...' % (n_coord))
     
     output_format = 'h5'
-    output_fname = save_path + '/' + output_format + 'NodeMotion.h5'
+    # output_fname = save_path + '/' + output_format + 'NodeMotion.h5'
+    output_fname = save_path + '/' + os.path.basename(h5_fname)[:-3] + '_motion.h5'
 
     generate_acc_dis_time(ssi_fname, coord_sys, ref_coord, user_x0, user_y0, user_z0, n_coord, start_t, end_t, tstep, rotate_angle, zeroMotionDir,gen_vel, gen_acc, gen_dis, verbose, plot_only, output_fname, mpi_rank, mpi_size, node_tags, extra_dname, output_format)
     
