@@ -13,6 +13,8 @@ if int(scipy.__version__.split('.')[1]) >= 6: # the function was renamed in SciP
   cumtrapz = scipy.integrate.cumulative_trapezoid
 else:
   cumtrapz = scipy.integrate.cumtrapz
+from scipy.interpolate import interpn
+
 
 import numpy as np
 import pandas as pd
@@ -271,7 +273,7 @@ def convert_to_essi_coord(coord_sys, from_x, from_y, from_z, ref_essi_xyz):
             user_essi_z = - from_xyz[i] + ref_essi_xyz[2]
     
     # return user_essi_x, user_essi_y, user_essi_z
-    return np.round(user_essi_x, decimals=8), np.round(user_essi_y, decimals=8), np.round(user_essi_z, decimals=8)
+    return np.round(user_essi_x, decimals=8), np.round(user_essi_y, decimals=8), np.round(user_essi_z, decimals=8) # remove round-off errors in the crds
 
     
 def get_coords_range(x, x_min_val, x_max_val, add_ghost):
@@ -345,9 +347,94 @@ def get_essi_meta(ssi_fname, verbose):
     t1 = t0 + dt*(nt-1)
     timeseq = np.linspace(t0, t1, nt)
     # print('dt, t0, t1, timeseq =', dt, t0, t1, timeseq)
+    
+    bTopo = False
+    zmin, zmax = z0, z0+nz*h
+    if 'z coordinates' in essiout:
+      bTopo = True
+      zmin, zmax = np.min(essiout['z coordinates'][:,:,0]), np.max(essiout['z coordinates'][:,:,-1])
     essiout.close()
     
-    return x0, y0, z0, h, nx, ny, nz, nt, dt, timeseq
+    return x0, y0, z0, h, nx, ny, nz, nt, dt, timeseq, bTopo, zmin, zmax
+
+
+def find_value(val, array):
+    """
+    Given an `array`, and given a `value`, returns an index j such that `value` is between array[j]
+    and array[j+1]. `array` must be monotonic increasing. j=-1 or j=len(array) is returned
+    to indicate that `value` is out of range below and above respectively.
+    """
+    n = len(array)
+    if val < array[0]:
+        return -1
+    if val > array[-1]:
+        return n
+
+    # Binary search
+    jl, ju = 0, n - 1
+    while ju - jl > 1:
+        jm = (ju + jl) // 2
+        if val >= array[jm]:
+            jl = jm
+        else:
+            ju = jm
+
+    return jl
+
+
+def get_coordz_topo(ssi_fname, coord_x, coord_y, user_essi_z):
+  ''' when topography is considered, get z array location based on its physical
+      z coordinates in the interpolated vertical profile between the upper and lower z
+      interfaces
+  '''
+  essiout = h5py.File(ssi_fname, 'r')
+  h  = essiout['ESSI xyz grid spacing'][0]
+  nt, nx, ny, nz = essiout['vel_0 ijk layout'].shape
+  # print("essiout['vel_0 ijk layout'].shape: ", essiout['vel_0 ijk layout'].shape)
+  
+  # *) x, y indices
+  # start
+  coord_x0 = coord_x.astype(int)
+  coord_y0 = coord_y.astype(int)
+  # end
+  coord_x1 = coord_x0 + 1
+  coord_y1 = coord_y0 + 1
+  coord_x1 = np.minimum(coord_x1, nx-1)
+  coord_y1 = np.minimum(coord_y1, ny-1)
+  # get distinct x, y values
+  x = list(set(coord_x0) | set(coord_x1)); x.sort()
+  y = list(set(coord_y0) | set(coord_y1)); y.sort()
+
+  # *) interpolated z profile upper and lower z physical coordinates
+  zcrds = essiout['z coordinates'][x[0]:x[-1]+1,y[0]:y[-1]+1,0] # upper interface
+  z_upper = zcrds[np.ix_(x-x[0], y-y[0])]
+  z_upper_interp = interpn((x, y), z_upper, np.c_[coord_x, coord_y])
+  
+  zcrds = essiout['z coordinates'][x[0]:x[-1]+1,y[0]:y[-1]+1,-1] # lower interface
+  z_lower = zcrds[np.ix_(x-x[0], y-y[0])]
+  z_lower_interp = interpn((x, y), z_lower, np.c_[coord_x, coord_y])
+
+  zprofile = np.linspace(z_upper_interp, z_lower_interp, num=nz)
+  
+  # *）z array location
+  coord_z = np.zeros_like(coord_x)
+  for iz, zi in enumerate(user_essi_z):
+    zprofile_i = zprofile[:,iz]
+    hi = zprofile_i[1] - zprofile_i[0]
+    ind_z = find_value(zi, zprofile_i)
+    # print('ind_z:', ind_z)
+    
+    if ind_z == -1 or ind_z == nz:
+      print(f'Error getting z array location: ({h*coord_x[iz]:.2f}, {h*coord_y[iz]:.2f}, {zi:.2f}) not within SW4 domain!')
+      exit(0)
+    coord_z[iz] = ind_z + (zi-zprofile_i[ind_z])/hi
+
+  essiout.close()
+  
+  print('coord_z consider topography:', coord_z)
+
+  return coord_z
+
 
 def get_essi_data_btw_step(ssi_fname, start, end, verbose):
     stime = float(time.perf_counter())
@@ -732,10 +819,10 @@ def linear_interp(data_dict, x, y, z):
 
 def generate_acc_dis_time(ssi_fname, coord_sys, ref_coord, user_x0, user_y0, user_z0, n_coord, start_t, end_t, tstep, rotate_angle, zeroMotionDir, gen_vel, gen_acc, gen_dis, verbose, plot_only, output_fname, mpi_rank, mpi_size, extra_data, extra_dname, output_format):
     # Read ESSI metadata
-    essi_x0, essi_y0, essi_z0, essi_h, essi_nx, essi_ny, essi_nz, essi_nt, essi_dt, essi_timeseq = get_essi_meta(ssi_fname, verbose)
+    essi_x0, essi_y0, essi_z0, essi_h, essi_nx, essi_ny, essi_nz, essi_nt, essi_dt, essi_timeseq, bTopo, zmin, zmax = get_essi_meta(ssi_fname, verbose)
     essi_x_len_max = (essi_nx-1) * essi_h
     essi_y_len_max = (essi_ny-1) * essi_h
-    essi_z_len_max = (essi_nz-1) * essi_h
+    essi_z_len_max = zmax - zmin
     
     # Start and end time step
     if start_t > -1e-6 and end_t > -1e-6:
@@ -766,7 +853,7 @@ def generate_acc_dis_time(ssi_fname, coord_sys, ref_coord, user_x0, user_y0, use
         print('\nESSI origin x0, y0, z0, h: ', essi_x0, essi_y0, essi_z0, essi_h)
         print('ESSI origin nx, ny, nz, nt, dt: ', essi_nx, essi_ny, essi_nz, essi_nt, essi_dt)
         print('ESSI max len x, y, z: ', essi_x_len_max, essi_y_len_max, essi_z_len_max)
-        print('ESSI max x, y, z: ', essi_x0+essi_x_len_max, essi_y0+essi_y_len_max, essi_z0+essi_z_len_max)
+        print('ESSI max x, y: ', essi_x0+essi_x_len_max, essi_y0+essi_y_len_max, f', (zmin, zmax): ({zmin:.2f}, {zmax:.2f})')
         print('Reference coordinate:', ref_coord)
         print(' ')
         print('Generate output file with timesteps between', start_ts, 'and', end_ts, 'with step interval', tstep, 'in', output_format, 'format')
@@ -850,17 +937,22 @@ def generate_acc_dis_time(ssi_fname, coord_sys, ref_coord, user_x0, user_y0, use
     # Convert to array location (spacing is 1), floating-point
     coord_x = (user_essi_x - essi_x0) / essi_h
     coord_y = (user_essi_y - essi_y0) / essi_h
-    coord_z = (user_essi_z - essi_z0) / essi_h  
+    if not bTopo:
+      coord_z = (user_essi_z - essi_z0) / essi_h
+    else:
+      coord_z = get_coordz_topo(ssi_fname, coord_x, coord_y, user_essi_z)
     
     # Check if we actually need interpolation
     # ghost_cell = 0
     # do_interp = True
     do_interp = False
     for nid in range(0, n_coord):
-        if user_essi_x[nid] % essi_h != 0 or user_essi_y[nid] % essi_h != 0 or user_essi_z[nid] % essi_h != 0:
+        # if user_essi_x[nid] % essi_h != 0 or user_essi_y[nid] % essi_h != 0 or user_essi_z[nid] % essi_h != 0:
+        if not math.isclose(coord_x[nid], int(coord_x[nid])) or not math.isclose(coord_y[nid], int(coord_y[nid])) or not math.isclose(coord_z[nid], int(coord_z[nid])):
             do_interp = True
             # ghost_cell = 1
-            print(f'user_essi_x[{nid}], user_essi_y[{nid}], user_essi_z[{nid}]: {user_essi_x[nid]:.4f}, f{user_essi_y[nid]:.4f}, f{user_essi_z[nid]:.4f}')
+            print(f'user_essi_x[{nid}], user_essi_y[{nid}], user_essi_z[{nid}]: {user_essi_x[nid]:.4f}, {user_essi_y[nid]:.4f}, {user_essi_z[nid]:.4f}')
+            # print(f'coord_x[{nid}], coord_y[{nid}], coord_z[{nid}]: {coord_x[nid]:.4e}, {coord_y[nid]:.4e}, {coord_z[nid]:.4e}')
             break    
     if mpi_rank == 0:
       if do_interp:
